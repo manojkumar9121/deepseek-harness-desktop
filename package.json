@@ -1,0 +1,24 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "0.1.0",
+  "description": "Electron desktop wrapper for DeepSeek Harness (dsh web)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "electron",
+    "desktop",
+    "dsh",
+    "agent"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "electron": "^43.4.0"
+  }
+}
