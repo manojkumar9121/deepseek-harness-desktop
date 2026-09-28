@@ -1,0 +1,53 @@
+appId: com.deepseek.harness
+productName: DeepSeek Harness
+directories:
+  output: dist
+
+files:
+  - main.js
+  - splash.html
+  - package.json
+  - scripts/refresh-openrouter-models.js
+  - build/icon.png
+
+# Bundle the staged DeepSeek Harness outside the asar so the packaged app
+# runs standalone (main.js resolves HARNESS_DIR to resourcesPath/harness).
+extraResources:
+  - from: dist/staging
+    to: harness
+    filter:
+      - "**/*"
+  - from: dist/staging/node_modules
+    to: harness/node_modules
+    filter:
+      - "**/*"
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  verifyUpdateCodeSignature: false
+  signExecutable: false
+  signAndEditExecutable: false
+
+linux:
+  target:
+    - AppImage
+  icon: build/icon.png
+  category: Development
+  synopsis: Desktop wrapper for DeepSeek Harness (dsh web)
+  syncDesktopName: true
+  desktop:
+    entry:
+      StartupWMClass: deepseek-harness-desktop
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: DeepSeek Harness

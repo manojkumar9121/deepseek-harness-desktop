@@ -2,9 +2,16 @@
   "name": "deepseek-harness-desktop",
   "version": "0.1.0",
   "description": "Electron desktop wrapper for DeepSeek Harness (dsh web)",
+  "author": "deepseek-ai",
+  "desktopName": "deepseek-harness-desktop",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "stage": "node scripts/stage-harness.js",
+    "build": "npm run stage && electron-builder build --config electron-builder.yml",
+    "package:win": "npm run stage && electron-builder build --win --config electron-builder.yml",
+    "package:mac": "npm run stage && electron-builder build --mac --config electron-builder.yml",
+    "package:linux": "npm run stage && electron-builder build --linux --config electron-builder.yml"
   },
   "keywords": [
     "deepseek",
@@ -16,9 +23,74 @@
   ],
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": "^22.19.0 || >=24"
   },
   "devDependencies": {
-    "electron": "^43.4.0"
+    "electron": "44.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.deepseek.harness",
+    "productName": "DeepSeek Harness",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "splash.html",
+      "package.json",
+      "scripts/refresh-openrouter-models.js",
+      "build/icon.png"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/staging",
+        "to": "harness",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "dist/staging/node_modules",
+        "to": "harness/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "verifyUpdateCodeSignature": false,
+      "signExecutable": false,
+      "signAndEditExecutable": false
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "icon": "build/icon.png",
+      "category": "Development",
+      "synopsis": "Desktop wrapper for DeepSeek Harness (dsh web)",
+      "syncDesktopName": true,
+      "desktop": {
+        "entry": {
+          "StartupWMClass": "deepseek-harness-desktop"
+        }
+      }
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DeepSeek Harness"
+    }
   }
 }

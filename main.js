@@ -1,19 +1,21 @@
-const { app, BrowserWindow, shell, Menu, screen } = require('electron')
+const { app, BrowserWindow, shell, Menu, screen, dialog } = require('electron')
 const { spawn } = require('node:child_process')
-const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
+const { refreshOpenRouterCatalog, refreshNvidiaCatalog, readEnvFile } = require('./scripts/refresh-openrouter-models')
 
 // Configurable via environment so the app can be published and reused:
-//   DSH_HARNESS_DIR  path to the deepseek-harness checkout (default ~/deepseek-harness)
+//   DSH_HARNESS_DIR  path to the deepseek-harness checkout (default bundled or ~/deepseek-harness)
 //   DSH_PORT         port the harness web UI serves on (default 3080)
 //   DSH_DESKTOP_DEBUG=1  extra diagnostics: screenshot + DOM dump to /tmp
-const HARNESS_DIR = process.env.DSH_HARNESS_DIR || path.join(os.homedir(), 'deepseek-harness')
+const HARNESS_DIR = process.env.DSH_HARNESS_DIR || (app.isPackaged ? path.join(process.resourcesPath, 'harness') : path.join(os.homedir(), 'deepseek-harness'))
 const PORT = Number(process.env.DSH_PORT) || 3080
 const DEFAULT_WIDTH = 1400
 const DEFAULT_HEIGHT = 900
-const UI_URL = `http://127.0.0.1:${PORT}/`
+const APP_ICON = path.join(__dirname, 'build', 'icon.png')
+const UI_ORIGIN = new URL(`http://127.0.0.1:${PORT}/`).origin
+let uiUrl = `${UI_ORIGIN}/`
 const BOOT_TIMEOUT_S = 120
 
 // Black-window fix on Wayland/Intel: GPU compositing renders nothing there,
@@ -35,76 +37,222 @@ if (!gotLock) {
   })
 }
 
-// The webserver accepts TCP as soon as it binds, before the plugin tree
-// (RPC gateway, client routes) is fully mounted; loading the SPA that early
-// leaves it on an empty dark shell. Poll for a real HTTP 200 instead.
-function httpReady() {
-  return fetch(UI_URL, { method: 'GET', signal: AbortSignal.timeout(2000) })
-    .then((res) => res.status === 200)
-    .catch(() => false)
+function redactTokens(value) {
+  return String(value).replace(/([?&]token=)[^&\s]+/gi, '$1<redacted>')
+}
+
+function isUiUrl(value) {
+  try {
+    return new URL(value).origin === UI_ORIGIN
+  } catch {
+    return false
+  }
+}
+
+function getHttpStatus(url) {
+  return fetch(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(2000) })
+    .then((res) => res.status)
+    .catch(() => 0)
+}
+
+function launchUrlFromLine(line) {
+  const match = line.match(/https?:\/\/[^\s]+/)
+  if (match === null) return null
+  try {
+    const candidate = new URL(match[0])
+    if (candidate.origin !== UI_ORIGIN || !candidate.searchParams.has('token')) return null
+    return candidate.toString()
+  } catch {
+    return null
+  }
 }
 
 async function startHarness() {
-  if (await httpReady()) {
-    console.log('[dsh-desktop] harness already running, attaching to port', PORT)
-    return
+  const configuredUrl = process.env.DSH_UI_URL
+  if (configuredUrl) {
+    const candidate = new URL(configuredUrl)
+    if (candidate.origin !== UI_ORIGIN) {
+      throw new Error(`DSH_UI_URL must use ${UI_ORIGIN}, received ${candidate.origin}`)
+    }
+    const status = await getHttpStatus(candidate)
+    if (status !== 200 && status !== 303) {
+      throw new Error(`DSH_UI_URL is not ready (HTTP ${status || 'no response'})`)
+    }
+    console.log('[dsh-desktop] harness already running, attaching to configured URL')
+    return candidate.toString()
   }
-  // Prefer the built CLI (boots ~2x faster); fall back to tsx source mode.
-  const builtBin = path.join(HARNESS_DIR, 'apps', 'cli', 'lib', 'bin.js')
-  const args = fs.existsSync(builtBin)
-    ? [builtBin, 'web']
-    : ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web']
-  dshProcess = spawn('node', args, {
+
+  const baseStatus = await getHttpStatus(`${UI_ORIGIN}/`)
+  if (baseStatus !== 0) {
+    throw new Error(`port ${PORT} is already serving an authenticated Harness; set DSH_UI_URL to its full launch URL including token`)
+  }
+
+  const nvidiaEnvFile = process.env.DSH_API_KEYS_DIR
+    ? path.join(process.env.DSH_API_KEYS_DIR, 'nvidia.env')
+    : path.join(os.homedir(), 'Documents', 'api keys', 'nvidia.env')
+  const nvidiaCreds = readEnvFile(nvidiaEnvFile)
+  const nvidiaKey = nvidiaCreds.nvidia ?? ''
+  if (nvidiaKey) process.env.NVIDIA_API_KEY = nvidiaKey
+
+  const builtBins = [
+    path.join(HARNESS_DIR, 'apps', 'cli', 'lib', 'bin.js'),
+    path.join(HARNESS_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+  ]
+  const builtBin = builtBins.find((candidate) => fs.existsSync(candidate))
+  if (builtBin === undefined && app.isPackaged) {
+    throw new Error(`packaged DeepSeek Harness runtime is missing under ${HARNESS_DIR}`)
+  }
+  const webArgs = ['web', '--host', '127.0.0.1', '--port', String(PORT), '--no-open']
+  const args = builtBin === undefined
+    ? ['--import', 'tsx/esm', 'apps/cli/src/bin.ts', ...webArgs]
+    : [builtBin, ...webArgs]
+  const nodeBin = app.isPackaged ? process.execPath : 'node'
+  const env = app.isPackaged ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' } : undefined
+  dshProcess = spawn(nodeBin, args, {
     cwd: HARNESS_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
+    env,
   })
-  dshProcess.stdout.on('data', (data) => console.log('[dsh]', String(data).trim()))
-  dshProcess.stderr.on('data', (data) => console.error('[dsh]', String(data).trim()))
-  dshProcess.on('exit', (code) => {
+
+  let launchUrl = null
+  let stdoutBuffer = ''
+  let stderrBuffer = ''
+  let spawnError = null
+  let exitCode = null
+  let exitSignal = null
+  const consume = (line) => {
+    const found = launchUrlFromLine(line)
+    if (found !== null) launchUrl = found
+  }
+  dshProcess.stdout.on('data', (data) => {
+    stdoutBuffer += String(data)
+    const lines = stdoutBuffer.split(/\r?\n/)
+    stdoutBuffer = lines.pop() ?? ''
+    for (const line of lines) {
+      consume(line)
+      console.log('[dsh]', redactTokens(line))
+    }
+  })
+  dshProcess.stderr.on('data', (data) => {
+    stderrBuffer += String(data)
+    const lines = stderrBuffer.split(/\r?\n/)
+    stderrBuffer = lines.pop() ?? ''
+    for (const line of lines) console.error('[dsh]', redactTokens(line))
+  })
+  dshProcess.once('error', (error) => {
+    spawnError = error
+  })
+  dshProcess.on('exit', (code, signal) => {
+    exitCode = code
+    exitSignal = signal
+    if (stdoutBuffer) {
+      consume(stdoutBuffer)
+      console.log('[dsh]', redactTokens(stdoutBuffer))
+    }
+    if (stderrBuffer) console.error('[dsh]', redactTokens(stderrBuffer))
     console.log('[dsh] exited with code', code)
     dshProcess = null
   })
+
   const deadline = Date.now() + BOOT_TIMEOUT_S * 1000
   while (Date.now() < deadline) {
+    if (spawnError !== null) throw spawnError
     if (dshProcess === null || dshProcess.exitCode !== null) break
-    if (await httpReady()) return
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+    if (launchUrl !== null && [200, 303].includes(await getHttpStatus(launchUrl))) return launchUrl
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  if (dshProcess === null) {
+    const status = exitSignal === null ? `code ${exitCode}` : `signal ${exitSignal}`
+    throw new Error(`dsh web exited before becoming ready (${status})`)
   }
   throw new Error(`dsh web did not become ready on port ${PORT} within ${BOOT_TIMEOUT_S}s`)
 }
 
+function executeJavaScriptWithTimeout(webContents, source, timeoutMs = 2000) {
+  let timer = null
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('renderer health check timed out')), timeoutMs)
+  })
+  return Promise.race([webContents.executeJavaScript(source), timeout]).finally(() => {
+    if (timer !== null) clearTimeout(timer)
+  })
+}
+
 // Self-healing loop: the SPA races server readiness (plugins mount after the
 // webserver binds), which shows as an empty shell or a "Failed to load
-// plugins" banner. Reload until the UI reports healthy.
+// plugins" banner. Wait through normal initialization and reload only an
+// explicit plugin failure.
 function attachHealthLoop() {
-  let healthChecks = 0
-  const healthTimer = setInterval(async () => {
-    if (mainWindow === null) {
-      clearInterval(healthTimer)
+  const window = mainWindow
+  if (window === null) return
+  const startedAt = Date.now()
+  let reloads = 0
+  let waitingLogged = false
+  let stopped = false
+  let timer = null
+
+  const stop = () => {
+    stopped = true
+    if (timer !== null) clearTimeout(timer)
+    timer = null
+  }
+  window.once('closed', stop)
+  window.webContents.once('render-process-gone', stop)
+  window.webContents.once('destroyed', stop)
+
+  async function check() {
+    if (stopped || window.isDestroyed() || mainWindow !== window) {
+      stop()
+      return
+    }
+    const elapsed = Date.now() - startedAt
+    if (elapsed >= 60000) {
+      stop()
+      console.error('[dsh-desktop] UI did not become healthy after 60s')
       return
     }
     try {
-      const state = await mainWindow.webContents.executeJavaScript(`JSON.stringify({
+      const state = await executeJavaScriptWithTimeout(window.webContents, `JSON.stringify({
         root: document.getElementById('root')?.children.length ?? -1,
+        booting: document.querySelector('[data-dsh-boot]') !== null,
         text: document.body.innerText.slice(0, 300),
       })`)
-      const { root, text } = JSON.parse(state)
-      const broken = root < 1 || /failed to load plugins|did not activate/i.test(text)
-      if (!broken) {
-        clearInterval(healthTimer)
-        console.log('[dsh-desktop] UI healthy')
-      } else if (healthChecks < 10) {
-        healthChecks++
-        console.log('[dsh-desktop] unhealthy shell, reloading (attempt', healthChecks + ')')
-        mainWindow.webContents.reload()
-      } else {
-        clearInterval(healthTimer)
-        console.error('[dsh-desktop] UI still unhealthy after', healthChecks, 'reloads')
+      if (Date.now() - startedAt >= 60000) {
+        stop()
+        console.error('[dsh-desktop] UI did not become healthy after 60s')
+        return
+      }
+      const { root, booting, text } = JSON.parse(state)
+      const pluginError = /failed to load plugins|did not activate/i.test(text)
+      if (!pluginError && !booting && root >= 1) {
+        const healthyAfter = Date.now() - startedAt
+        stop()
+        console.log('[dsh-desktop] UI healthy after', healthyAfter, 'ms')
+        return
+      }
+      if (pluginError && reloads < 2) {
+        reloads++
+        waitingLogged = false
+        console.log('[dsh-desktop] plugin load failed, reloading (attempt', reloads + ')')
+        window.webContents.reload()
+        timer = setTimeout(check, 2000)
+        return
+      }
+      if (!waitingLogged && elapsed >= 2000) {
+        console.log('[dsh-desktop] waiting for Harness plugins to mount')
+        waitingLogged = true
       }
     } catch {
-      // Page mid-navigation; check again next tick.
+      if (Date.now() - startedAt >= 60000) {
+        stop()
+        console.error('[dsh-desktop] UI health checks failed for 60s')
+        return
+      }
     }
-  }, 5000)
+    if (!stopped) timer = setTimeout(check, 500)
+  }
+
+  void check()
 }
 
 function createWindow() {
@@ -119,6 +267,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 600,
     title: 'DeepSeek Harness',
+    icon: APP_ICON,
     backgroundColor: '#101014',
     webPreferences: {
       nodeIntegration: false,
@@ -126,11 +275,11 @@ function createWindow() {
       sandbox: true,
     },
   })
-  mainWindow.center()
+  mainWindow.maximize()
   mainWindow.loadFile(path.join(__dirname, 'splash.html'))
   mainWindow.webContents.on('did-finish-load', () => {
     // Only diagnose the real UI page, not the splash.
-    if (mainWindow.webContents.getURL() !== UI_URL) return
+    if (!isUiUrl(mainWindow.webContents.getURL())) return
     console.log('[dsh-desktop] page loaded')
     if (process.env.DSH_DESKTOP_DEBUG === '1') {
       setTimeout(async () => {
@@ -167,11 +316,10 @@ function createWindow() {
   mainWindow.webContents.on('render-process-gone', (event, details) => {
     console.error('[dsh-desktop] renderer gone:', details.reason)
   })
-  mainWindow.webContents.on('console-message', (event, level, message) => {
-    const lvl = event?.level ?? level
-    const msg = event?.message ?? message
-    if (lvl === 'error' || lvl === 3 || lvl === 'warning' || lvl === 2) {
-      console.log('[page]', lvl, msg)
+  mainWindow.webContents.on('console-message', (event) => {
+    const { level, message } = event
+    if (level === 'warning' || level === 'error') {
+      console.log('[page]', level, message)
     }
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -179,7 +327,7 @@ function createWindow() {
     return { action: 'deny' }
   })
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) return
+    if (isUiUrl(url)) return
     event.preventDefault()
     shell.openExternal(url)
   })
@@ -189,18 +337,54 @@ function createWindow() {
 app.whenReady().then(async () => {
   Menu.setApplicationMenu(null)
   createWindow() // shows the splash immediately
+  // Fresh OpenRouter models land in pi-ai's static catalog only at release
+  // time; patch it before the harness boots so the picker sees new ids every
+  // launch. Dev mode only: the packaged production runtime is immutable.
+  if (!app.isPackaged && process.env.DSH_REFRESH_MODELS === '1') {
+    try {
+      await refreshOpenRouterCatalog(HARNESS_DIR, console.log)
+    } catch (error) {
+      console.warn('[dsh-desktop] openrouter catalog refresh skipped:', error.message)
+    }
+    // NVIDIA catalog: read the NVAPI key from the user's api-keys dir.
+    const envFile = process.env.DSH_API_KEYS_DIR
+      ? path.join(process.env.DSH_API_KEYS_DIR, 'nvidia.env')
+      : path.join(os.homedir(), 'Documents', 'api keys', 'nvidia.env')
+    const env = readEnvFile(envFile)
+    const nvidiaKey = env.nvidia ?? ''
+    if (nvidiaKey) {
+      try {
+        await refreshNvidiaCatalog(HARNESS_DIR, console.log, nvidiaKey)
+      } catch (error) {
+        console.warn('[dsh-desktop] nvidia catalog refresh skipped:', error.message)
+      }
+    }
+  }
   try {
-    await startHarness()
+    uiUrl = await startHarness()
   } catch (error) {
-    console.error('[dsh-desktop]', error.message)
+    const details = error instanceof Error ? (error.stack ?? error.message) : String(error)
+    console.error('[dsh-desktop]', details)
+    dialog.showErrorBox('DeepSeek Harness failed to start', details)
     app.quit()
     return
   }
   console.log('[dsh-desktop] harness ready, loading UI')
-  mainWindow.loadURL(UI_URL)
-  attachHealthLoop()
+  if (mainWindow !== null) {
+    mainWindow.loadURL(uiUrl).catch((error) => {
+      console.error('[dsh-desktop] failed to load UI:', error)
+      dialog.showErrorBox('DeepSeek Harness failed to load', error.message)
+      app.quit()
+    })
+    attachHealthLoop()
+  }
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (BrowserWindow.getAllWindows().length !== 0) return
+    createWindow()
+    if (uiUrl.includes('token=')) {
+      mainWindow.loadURL(uiUrl)
+      attachHealthLoop()
+    }
   })
 })
 

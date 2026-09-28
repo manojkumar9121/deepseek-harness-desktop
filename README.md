@@ -12,7 +12,7 @@ Turns the harness's local web UI into a native window: instant splash screen whi
 
 ## Prerequisites
 
-- **Node.js >= 20** (the harness requires Node 22+ — see its README)
+- **Node.js 22.19+ or 24+** (required by Electron Builder and DeepSeek Harness)
 - A **DeepSeek Harness checkout**, built:
 
 ```bash
@@ -38,7 +38,9 @@ That's it. The app spawns `dsh web` (built CLI if present, source mode otherwise
 | -------------------- | -------------------- | ---------------------------------------- |
 | `DSH_HARNESS_DIR`    | `~/deepseek-harness` | Path to the harness checkout             |
 | `DSH_PORT`           | `3080`               | Port the harness web UI listens on       |
+| `DSH_UI_URL`         | unset                | Full authenticated launch URL for an existing Harness process |
 | `DSH_DESKTOP_DEBUG`  | off                  | `1` dumps DOM + screenshot to `/tmp`     |
+| `DSH_REFRESH_MODELS` | off                  | `1` enables launch-time OpenRouter/NVIDIA catalog refreshes |
 
 Example:
 
@@ -46,19 +48,30 @@ Example:
 DSH_HARNESS_DIR=/opt/deepseek-harness DSH_PORT=4000 npm start
 ```
 
-If something is already listening on the port, the app attaches to it instead of spawning its own server.
+To attach to an existing Harness process, pass its full tokenized startup URL through `DSH_UI_URL`. The app never loads an unauthenticated local service.
 
 ## How it works
 
 1. Window opens instantly with a splash screen.
-2. The app spawns `node apps/cli/lib/bin.js web` (or `tsx` source mode as fallback) as a child process.
-3. It polls for a real HTTP 200 (a TCP connect is not enough — the webserver binds before the plugin/RPC tree is mounted).
-4. The UI is loaded, and a health loop reloads the page if the SPA raced server readiness ("Failed to load plugins" / empty shell).
+2. Model catalog refreshes are opt-in in development with `DSH_REFRESH_MODELS=1`; packaged builds never modify their immutable runtime.
+3. In development, the app spawns the built checkout CLI (or `tsx` source mode as fallback). Packaged builds run the exact-version production CLI staged under `resources/harness/node_modules`.
+4. It captures the tokenized launch URL printed by `dsh web` and waits for its authenticated HTTP response before loading the UI.
+5. The UI is loaded, and a health loop reloads the page if the SPA raced server readiness ("Failed to load plugins" / empty shell).
+
+## Packaging
+
+Packaging commands stage the matching published Harness runtime automatically:
+
+```bash
+npm run package:linux
+```
+
+The staged runtime includes the CLI, Web frontend, production dependencies, and Linux native modules.
 
 ## Troubleshooting
 
 - **Window shows "Failed to load plugins"** — the SPA raced the server; the health loop reloads automatically. If it persists, wait for the harness to finish booting and restart the app.
-- **Port already in use** — the app attaches to the existing server; close the other `dsh web` if you want the app to own the lifecycle.
+- **Port already in use** — current Harness releases require the tokenized URL printed at startup. Set `DSH_UI_URL` to that full URL when attaching to an existing server, or close the other `dsh web` process.
 - **Blank/black window on Linux** — hardware acceleration is disabled by default; set `DSH_DESKTOP_DEBUG=1` and check `/tmp/dsh-window.png` to see what the renderer produced.
 
 ## License
